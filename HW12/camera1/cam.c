@@ -1,71 +1,4 @@
-#include <stdio.h>
-#include "pico/stdlib.h"
-#include "hardware/i2c.h"
-#include "hardware/gpio.h"
-#include "hardware/pwm.h"
-#include "ov7670.h"
-
-// I2C defines
-#define I2C_PORT i2c1
-#define I2C_SDA 14
-#define I2C_SCL 15
-
-// pins
-// D0-D7 on GP0-GP7
-#define D0 0
-#define D1 1
-#define D2 2
-#define D3 3
-#define D4 4
-#define D5 5
-#define D6 6
-#define D7 7
-// VS on GP8
-#define VS 8
-// HS on GP9
-#define HS 9
-// MCLK on GP10, set 50% 10MHz PWM
-#define MCLK 10
-// PCLK on GP11
-#define PCLK 11
-// RST to GP12
-#define RST 12
-// PWDN to float (or GND?)
-
-// RGB565 example:
-// https://blog.usedbytes.com/2022/02/pico-pio-camera/
-
-void init_camera_pins();
-void init_camera();
-void setSaveImage(uint32_t);
-uint32_t getSaveImage();
-uint32_t getHSCount();
-uint32_t getPixelCount();
-void convertImage();
-void printImage();
-
-static volatile uint8_t saveImage = 0; // user requests image
-static volatile uint8_t startImage = 0; // got a start of frame
-static volatile uint8_t startCollect = 0; // got a start of row
-static volatile uint32_t rawIndex = 0;
-static volatile uint32_t hsCount = 0;
-static volatile uint32_t vsCount = 0;
-#define IMAGESIZEX 80
-#define IMAGESIZEY 60
-static volatile uint8_t cameraData[IMAGESIZEX*IMAGESIZEY*2];
-
-typedef struct cameraImage{
-    uint32_t index;
-    uint8_t r[IMAGESIZEX*IMAGESIZEY];
-    uint8_t g[IMAGESIZEX*IMAGESIZEY];
-    uint8_t b[IMAGESIZEX*IMAGESIZEY];
-} cameraImage_t;
-static volatile struct cameraImage picture;
-// I2C functions
-void OV7670_write_register(uint8_t reg, uint8_t value);
-uint8_t OV7670_read_register(uint8_t reg);
-void OV7670_test_pattern(OV7670_pattern pattern);
-
+#include "cam.h"
 
 void gpio_callback(uint gpio, uint32_t events) {
     if (gpio == VS){
@@ -119,29 +52,6 @@ void gpio_callback(uint gpio, uint32_t events) {
     }
 }
 
-int main()
-{
-    stdio_init_all();
-
-    while (!stdio_usb_connected()) {
-        sleep_ms(100);
-    }
-    printf("Hello, camera!\n");
-
-    init_camera_pins();
- 
-    while (true) {
-        //sleep_ms(1000);
-        char m[10];
-        scanf("%s",m);
-        setSaveImage(1);
-        while(getSaveImage()==1){}
-        //printf("HS count = %d PixelCount = %d\n",getHSCount(), getPixelCount());
-        convertImage();
-        printImage();
-    }
-}
-
 // setup the camera pins
 void init_camera_pins(){
     // 8 data pins
@@ -166,10 +76,14 @@ void init_camera_pins(){
     gpio_set_dir(RST, GPIO_OUT);
     gpio_put(RST, 1);
 
-    // set MCLK to 50% 10MHz PWM
+    gpio_init(PWDN); // powerdown pin
+    gpio_set_dir(PWDN, GPIO_OUT);
+    gpio_put(PWDN, 0);
+
+    // set MCLK to 50% 25MHz PWM -> actually only 18.75MHz
     gpio_set_function(MCLK, GPIO_FUNC_PWM); // Set the LED Pin to be PWM
     uint slice_num = pwm_gpio_to_slice_num(MCLK); // Get PWM slice number
-    float div = 2; // must be between 1-255
+    float div = 2; // must be between 1-255, 2 for 25MHz
     pwm_set_clkdiv(slice_num, div); // divider
     uint16_t wrap = 3; // when to rollover, must be less than 65535
     pwm_set_wrap(slice_num, wrap);
@@ -177,6 +91,12 @@ void init_camera_pins(){
     pwm_set_gpio_level(MCLK, wrap / 2); // set the duty cycle to 50%
 
     sleep_ms(1000); // give the camera time to get going
+
+    // powerdown and restart
+    gpio_put(PWDN, 1);
+    sleep_ms(1);
+    gpio_put(PWDN, 0);
+    sleep_ms(1000);
 
     // I2C Initialisation. Using it at 100Khz.
     i2c_init(I2C_PORT, 100*1000);
@@ -218,19 +138,20 @@ void init_camera(){
     sleep_ms(1000);
 
     // perform all the I2C writes for init
-    // 25MHz * PLL / divisor = 24MHz for 30fps
+    // 25MHz * PLL / divisor = 24MHz for 30fps -> actually only 5fps
     OV7670_write_register(OV7670_REG_CLKRC, 1); // div 1
     OV7670_write_register(OV7670_REG_DBLV, 0); // no pll
 
-    // set colorspace to RGB565
     int i = 0;
-    for(i=0; i<3; i++){
-        OV7670_write_register(OV7670_rgb[i][0],OV7670_rgb[i][1]);
-    }
 
     // init regular registers
     for(i=0; i<92; i++){
         OV7670_write_register(OV7670_init[i][0],OV7670_init[i][1]);
+    }
+
+    // set colorspace to RGB565
+    for(i=0; i<12; i++){
+        OV7670_write_register(OV7670_rgb[i][0],OV7670_rgb[i][1]);
     }
 
     // init image size
@@ -298,15 +219,15 @@ void init_camera(){
 
     sleep_ms(300); // allow camera to settle with new settings 
 
+    //OV7670_test_pattern(OV7670_TEST_PATTERN_NONE);
     //OV7670_test_pattern(OV7670_TEST_PATTERN_COLOR_BAR);
-
-    sleep_ms(300);
+    //sleep_ms(300);
 
     uint8_t p = OV7670_read_register(OV7670_REG_PID);
-    printf("pid = %d\n",p);
+    printf("pid = %d (118)\n",p);
 
     uint8_t v = OV7670_read_register(OV7670_REG_VER);
-    printf("pid = %d\n",v);
+    printf("ver = %d (115)\n",v);
 }
 
 // Selects one of the camera's test patterns (or disable).
@@ -375,25 +296,68 @@ void convertImage(){
     int i = 0;
     for(i=0;i<IMAGESIZEX*IMAGESIZEY*2;i=i+2){
         
-        picture.r[picture.index] = cameraData[i]>>3;
-        picture.g[picture.index] = ((cameraData[i]&0b111)<<3) | cameraData[i+1]>>5;
-        picture.b[picture.index] = cameraData[i+1]&0b11111;
-        
-       /*
-        picture.r[picture.index] = cameraData[i];
-        picture.g[picture.index] = cameraData[i];
-        picture.b[picture.index] = cameraData[i];
-        */
+        picture.r[picture.index] = (cameraData[i+1]>>3)<<3;
+        picture.g[picture.index] = (((cameraData[i+1]&0b111)<<3) | cameraData[i]>>5)<<2;
+        picture.b[picture.index] = (cameraData[i]&0b11111)<<3;
         picture.index++;
     }
+}
+
+// threshold and then find the center of mass of a row
+int findLine(int row){
+    int pos = 0;
+    int r = row*IMAGESIZEX; // find the index of the start of the row in the pixel array
+    int sumMass = 0;
+    int sumMassR = 0;
+
+    int i;
+
+    // find the row average brightness
+    int sumBright = 0;
+    for(i=0;i<IMAGESIZEX;i++){
+        sumBright = sumBright + picture.r[r+i] + picture.g[r+i] + picture.b[r+i];
+    }
+    int avgBright = sumBright / IMAGESIZEX;
+
+    // threshold the row
+    for(i=0;i<IMAGESIZEX;i++){
+        int mass = picture.r[r+i] + picture.g[r+i] + picture.b[r+i];
+        if (mass < avgBright){
+            // not bright enough, set pixel to black
+            picture.r[r+i] = 0;
+            picture.g[r+i] = 0;
+            picture.b[r+i] = 0;
+        }
+        else {
+            // set to white
+            picture.r[r+i] = 255;
+            picture.g[r+i] = 255;
+            picture.b[r+i] = 255;
+        }
+    }
+
+    // calculate the center of mass of the thresholded row
+    for(i=0;i<IMAGESIZEX;i++){
+        int mass = picture.r[r+i] + picture.g[r+i] + picture.b[r+i];
+        sumMass = sumMass + mass;
+        sumMassR = sumMassR + mass*i;
+    }
+    float centerOfMass = (float)sumMassR / sumMass;
+    return (int)(centerOfMass);
+}
+
+// change the color of a pixel for visualization purposes
+void setPixel(int row, int col, uint8_t r, uint8_t g, uint8_t b){
+    int index = row*IMAGESIZEX+col;
+    picture.r[index] = r;
+    picture.g[index] = g;
+    picture.b[index] = b;
 }
 
 // print out the image to computer
 void printImage(){
     int i = 0;
-    //printf("a\r\n"); // send a start frame byte
     for(i=0;i<IMAGESIZEX*IMAGESIZEY;i++){
         printf("%d %d %d %d\r\n", i, picture.r[i], picture.g[i], picture.b[i]);
     }
-    //printf("b\r\n"); // send a stop frame byte
 }
